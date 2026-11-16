@@ -1,0 +1,137 @@
+# 给 glibc（Linux arm64）编 Turnip —— Mesa 26.2.7 的 freedreno Vulkan ICD。
+#
+# 为什么需要：termux-glibc 仓库的 mesa-vulkan-icd-freedreno-glibc 停在 Mesa 24.2.6，
+# 而 Adreno 8xx（840/830…）是 Mesa 26.0 才进 Turnip 的（MR 38450）。在 Adreno 840
+# 上 24.2 报 VK_ERROR_INCOMPATIBLE_DRIVER（chip_id = 44050A31 … is unsupported），
+# 所以给 cccodroid 的 gpu-driver-glibc 组件编一份 26.2.7（与 bionic 侧 gpu-driver
+# 组件的 Termux 包同版本）。
+#
+# 兼容性约束（真机是 termux-glibc 运行时：glibc 2.44、libdrm 2.4.134、GCC 15 的
+# libstdc++）：在 ubuntu-24.04-arm（glibc 2.39）上原生编，产物只链接 soname 稳定的
+# 库（libdrm/libxcb/libxshmfence/libexpat/libz/libzstd/libwayland-client/libstdc++），
+# 设备侧同名库版本都 ≥ 跑机版本，符号版本向后兼容。构建末步核验最高 GLIBC_ 符号
+# 版本 ≤ 2.39，超过直接失败。
+#
+# 产物：libvulkan_freedreno.so（strip 过）+ SHA256SUMS。
+# 配方来源：mesa-vulkan-icd-freedreno 的 Termux 构建配方（x11 与 wayland 两个平台，
+# 只开 vulkan 的 freedreno，不开 gallium/GL/EGL/LLVM）。
+name: build-turnip
+
+on:
+  workflow_dispatch:
+  # 打 turnip-build-* 标签 → 构建并发布成 turnip-<日期>（发布标签不再触发构建，免得循环重建）
+  push:
+    tags: ["turnip-build-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  turnip:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      MESA_VER: 26.2.7
+      MESA_SHA: 04294f75d22e9f61cd1e050206bc48b3d39366e788f1803a3368e3d5a872ce18
+    steps:
+      - name: 腾地方
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/lib/node_modules /usr/share/swift
+          sudo apt-get clean
+          df -h /
+
+      - name: 取 Mesa 源码（钉 sha256）
+        run: |
+          curl -fL --retry 3 -o mesa.tar.xz \
+            "https://archive.mesa3d.org/mesa-$MESA_VER.tar.xz"
+          echo "$MESA_SHA  mesa.tar.xz" | sha256sum -c -
+          tar -xJf mesa.tar.xz
+          mv "mesa-$MESA_VER" src
+
+      - name: 装构建工具（meson 用 pip 的 ≥1.4；glslangValidator 源码装 ≥12.2）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config python3-mako python3-pip \
+            libdrm-dev libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev \
+            libxcb-shm0-dev libxcb-xfixes0-dev libx11-dev libx11-xcb-dev libxext-dev \
+            libxshmfence-dev libexpat1-dev zlib1g-dev libzstd-dev
+          # sudo 装到 /usr/local：用户与 root 都能跑（装 ~/.local 时 sudo 会缺 mesonbuild 模块）
+          sudo pip install --break-system-packages meson
+          # glslangValidator ≥12.2：Mesa 26.2 的 freedreno Vulkan（bvh）构建要它，ubuntu 24.04 只有 12.0；
+          # 源码编（不用 SPIRV-Tools，不开 HLSL，只要 StandAlone 的 glslangValidator，很快）
+          curl -fL --retry 3 -o glslang.tar.gz \
+            "https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz"
+          echo "9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2  glslang.tar.gz" | sha256sum -c -
+          tar -xzf glslang.tar.gz
+          cmake -S glslang-16.6.0 -B gbuild -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DENABLE_SPVREMAPPER=OFF -DENABLE_CTEST=OFF
+          cmake --build gbuild --target glslang-standalone -j "$(nproc)"
+          sudo install -Dm755 gbuild/StandAlone/glslangValidator /usr/local/bin/glslangValidator
+          glslangValidator --version | head -1
+
+      - name: 配置（只编 freedreno 的 Vulkan ICD；不编 gallium/GL/EGL/LLVM）
+        run: |
+          # 只编 x11 平台：meson 的 wayland 模块要求 wayland-scanner 版本与 wayland-client
+          # （ubuntu 24.04 是 1.22）严格一致，装新版 scanner 反而过不了；而 Android 上
+          # 没有 Wayland/X11 服务端，表面扩展都用不上，x11 只是满足构建依赖，不带 wayland 更干净
+          meson setup build src \
+            -Dvulkan-drivers=freedreno \
+            -Dgallium-drivers= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+            -Dllvm=disabled \
+            -Dplatforms=x11 \
+            -Dxlib-lease=disabled \
+            -Dbuild-tests=false \
+            --buildtype=release -Dprefix=/usr
+
+      - name: 编
+        run: ninja -C build
+
+      - name: 收产物并核验
+        run: |
+          set -x
+          meson install -C build --destdir out
+          # destdir 相对构建目录解析，落在 build/out/ 下
+          SO=$(find build/out -name 'libvulkan_freedreno.so*' -type f | head -1)
+          [ -n "$SO" ] || { echo "没编出 libvulkan_freedreno.so"; exit 1; }
+          mkdir -p dist
+          install -Dm755 "$SO" dist/libvulkan_freedreno.so
+          strip --strip-unneeded dist/libvulkan_freedreno.so
+          # 符号版本核验：只能在 ubuntu 24.04 的 glibc 2.39 以内，真机（termux-glibc 2.44）才装得上
+          MAXGLIBC=$(objdump -T dist/libvulkan_freedreno.so | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 | sed 's/^GLIBC_//')
+          echo "最高 GLIBC 符号版本：${MAXGLIBC:-（无）}"
+          case "$MAXGLIBC" in 2.3[0-9]|2.2[0-9]|2.1[0-9]) ;; *) echo "GLIBC 符号版本超限"; exit 1 ;; esac
+          echo "NEEDED："
+          readelf -d dist/libvulkan_freedreno.so | grep NEEDED | sed 's/^ *//'
+          # ICD manifest：meson install 生成的这份 library_path 是构建机路径（/usr/lib/…），
+          # 故意原样发布 —— 设备上的 lgpu-run 发现指不到文件时会现场再生一份指对位置的
+          JSON=$(find build/out -name 'freedreno_icd.aarch64.json' | head -1)
+          [ -n "$JSON" ] || { echo "没生成 ICD manifest"; exit 1; }
+          install -Dm644 "$JSON" dist/freedreno_icd.aarch64.json
+          ls -la dist/
+          sha256sum dist/libvulkan_freedreno.so dist/freedreno_icd.aarch64.json | tee dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-glibc-aarch64
+          path: dist/
+          if-no-files-found: error
+
+      - name: 发布（打 turnip-build-* 标签时；发成 turnip-<日期>）
+        if: startsWith(github.ref, 'refs/tags/turnip-build-')
+        run: |
+          REL="turnip-${GITHUB_REF_NAME#turnip-build-}"
+          gh release create "$REL" dist/libvulkan_freedreno.so dist/freedreno_icd.aarch64.json dist/SHA256SUMS \
+            --repo greyoak111/cccodroid-gpu-driver-snapdragon \
+            --target "$GITHUB_SHA" \
+            --title "Turnip ${MESA_VER} (glibc / Linux arm64) ${REL#turnip-}" \
+            --notes "Mesa ${MESA_VER} 的 freedreno Vulkan ICD（Turnip），glibc 版，给 Android 上的
+          Linux arm64 程序用。只编了 vulkan-drivers=freedreno（x11 平台；Android 上没有
+          显示服务器，wayland 表面扩展用不上，且 ubuntu 24.04 的 wayland 工具链版本过老），
+          没编 gallium/GL/EGL。符号版本 ≤ glibc 2.39（termux-glibc 2.44 运行时可加载）。
+          配 cccodroid 的 gpu-driver-glibc 组件用（lgpu-run 自动优先）。
+          源码 mesa-${MESA_VER}.tar.xz，sha256 ${MESA_SHA}。"
+        env:
+          GH_TOKEN: ${{ github.token }}
